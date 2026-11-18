@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 浅色系统：浅色窗口底（页面加载前）+ 浅色状态栏 -->
+    <color name="window_bg">#FFF6F6F7</color>
+    <!-- 启动器图标底色（取自设计稿 #2D2D2D） -->
+    <color name="ic_launcher_bg">#FF2D2D2D</color>
+    <!-- 启动闪屏底色（与页面深色主题一致） -->
+</resources>

@@ -1,0 +1,24 @@
+<resources>
+    <string name="app_name">ZCode</string>
+    <string name="notif_keepalive_title">ZCode 连接保持中</string>
+    <string name="notif_keepalive_text">后台保持与桌面端的连接，以便接收任务通知</string>
+    <string name="notif_channel_keepalive">连接保持</string>
+    <string name="notif_channel_alerts">任务提醒</string>
+    <string name="notif_channel_alerts_desc">任务完成、失败或需要你确认时提醒</string>
+    <string name="notif_action_rescan">重新扫码</string>
+    <string name="scan_title">扫码绑定</string>
+    <string name="scan_hint">用手机相机扫描 ZCode 桌面端「手机扫码连接」二维码</string>
+    <string name="scan_invalid_url">这不是 ZCode 绑定二维码，请扫桌面端出示的二维码</string>
+    <string name="scan_permission_denied">需要相机权限才能扫码</string>
+    <string name="scan_no_camera">未找到可用相机</string>
+    <string name="scan_from_gallery">从相册选择二维码</string>
+    <string name="scan_no_qr_in_image">这张图片里没有有效的 ZCode 绑定二维码</string>
+    <string name="menu_rescan">重新扫码</string>
+    <string name="menu_reload">刷新页面</string>
+    <string name="menu_settings">设置</string>
+    <string name="settings_keepalive">后台提醒</string>
+    <string name="settings_keepalive_desc">锁屏或切到其他 App 时仍能收到任务提醒。使用 App 期间不会出现任何常驻通知（仅退到后台时系统要求挂一条隐藏提示）。</string>
+    <string name="settings_sound">提醒声音</string>
+    <string name="web_offline">页面加载失败，请检查网络</string>
+    <string name="web_retry">重试</string>
+</resources>

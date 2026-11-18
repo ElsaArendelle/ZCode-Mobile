@@ -1,0 +1,26 @@
+# Gradle
+.gradle/
+build/
+/captures
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# Kotlin
+.kotlin/
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+.DS_Store
+
+# 项目调试产物（不入库）
+.debug/
+.zcode/
+chunklist.txt
+zcchunks/
+
+# 签名与隐私（切勿提交）
+*.jks
+*.keystore
+key.properties

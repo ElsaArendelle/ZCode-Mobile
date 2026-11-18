@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 深色系统：深色窗口底 + 深色状态栏（同 ZCode 页面深色主题） -->
+    <color name="window_bg">#FF141417</color>
+</resources>
