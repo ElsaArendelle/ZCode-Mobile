@@ -1,7 +1,7 @@
 package com.autosquare.zcode.mobile.ui
 
 import android.annotation.SuppressLint
-import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
@@ -43,6 +43,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,13 +55,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import androidx.core.content.ContextCompat
 import com.autosquare.zcode.mobile.R
 import com.autosquare.zcode.mobile.data.BindingStore
 import com.autosquare.zcode.mobile.notify.Notifier
+import com.autosquare.zcode.mobile.notify.TaskAlert
 import com.autosquare.zcode.mobile.service.ConnectionService
 import com.autosquare.zcode.mobile.web.AuthAssets
 import com.autosquare.zcode.mobile.web.NativeBridge
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import org.json.JSONObject
+import kotlin.coroutines.resume
 
 private const val TAG = "ZCodeWeb"
 
@@ -72,7 +77,7 @@ private const val TAG = "ZCodeWeb"
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun WebScreen(url: String, onNeedRescan: () -> Unit) {
+fun WebScreen(url: String, alert: TaskAlert?, onAlertHandled: (TaskAlert) -> Unit, onNeedRescan: () -> Unit) {
     val context = LocalContext.current
     val injectJs = remember {
         try {
@@ -94,6 +99,40 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
 
     // 首帧加载态：页面 onPageFinished 前显示 logo + 转圈，替代白屏
     var pageLoaded by remember { mutableStateOf(false) }
+    var alertDetail by remember { mutableStateOf<TaskAlert?>(null) }
+    LaunchedEffect(alert, webView, pageLoaded) {
+        val target = alert ?: return@LaunchedEffect
+        val view = webView ?: return@LaunchedEffect
+        if (!pageLoaded) return@LaunchedEffect
+        alertDetail = null
+        val args = listOf(target.token, target.taskId, target.body).joinToString(",") { JSONObject.quote(it) }
+        for (attempt in 0 until 90) {
+            if (!target.sameBinding) break
+            val page = Uri.parse(view.url.orEmpty())
+            if (page.scheme == "https" && page.host == Uri.parse(url).host &&
+                page.path?.startsWith("/remote/v4") == true) {
+                val result = suspendCancellableCoroutine<String> { continuation ->
+                    view.evaluateJavascript("window.__zcOpenAlert && window.__zcOpenAlert($args)") {
+                        if (continuation.isActive) continuation.resume(it.orEmpty())
+                    }
+                }
+                if (result == "\"opened\"") {
+                    onAlertHandled(target)
+                    return@LaunchedEffect
+                }
+                if (result == "\"detail\"" && (attempt >= 10 || !target.body.startsWith("任务："))) break
+            }
+            delay(500)
+        }
+        alertDetail = target
+        onAlertHandled(target)
+    }
+
+    alertDetail?.let { message ->
+        AlertDialog(onDismissRequest = { alertDetail = null }, title = { Text(message.title) },
+            text = { Text(message.body.ifBlank { "这条提醒没有提供可打开的任务。" }) },
+            confirmButton = { TextButton(onClick = { alertDetail = null }) { Text("关闭") } })
+    }
 
     // 授权窗口始终独立承载，主页面保留发起授权时的轮询与状态。
     fun openAuthDialog(): WebView {
@@ -130,7 +169,7 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
         }
         aw.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(v: WebView, request: WebResourceRequest) =
-                AuthAssets.load(request)
+                AuthAssets.load(context, request)
 
             override fun onPageCommitVisible(v: WebView, url: String) {
                 if (!failed) progress.visibility = android.view.View.GONE
@@ -166,6 +205,7 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
             }
 
             override fun onReceivedError(v: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (request.isForMainFrame || AuthAssets.matches(request.url)) Log.w(TAG, "auth load error ${error.errorCode} ${request.url.host}${request.url.path} main=${request.isForMainFrame}")
                 if (request.isForMainFrame || AuthAssets.matches(request.url)) showError("登录页面未能加载，请重试。")
             }
 
@@ -220,19 +260,9 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
         return aw
     }
 
-    // 最近一次页面自发提示音（pop）时间，用于避免与系统通知双重响铃
-    var lastPopAt by remember { mutableStateOf(0L) }
-
-    // 通知权限（API 33+ 运行时请求）；授权后重发常驻通知（FGS 通知在授权前发出会被隐藏）
+    // 请求权限后的前后台切换统一由 Activity 管理。
     val notifLauncher =
-        rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted && BindingStore.keepaliveEnabled(context)) {
-                ContextCompat.startForegroundService(
-                    context,
-                    Intent(context, ConnectionService::class.java),
-                )
-            }
-        }
+        rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
     LaunchedEffect(Unit) {
         Notifier.ensureChannels(context)
         if (!Notifier.hasNotificationPermission(context)) {
@@ -242,7 +272,6 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
 
     // 前台使用期间不挂任何常驻通知：保活服务由 MainActivity 在 onPause 时启动、onResume 时停止
     LaunchedEffect(Unit) {
-        runCatching { context.stopService(Intent(context, ConnectionService::class.java)) }
         // 首次使用提示长按手势（只提示一次）
         val prefs = context.getSharedPreferences("zcode_binding", android.content.Context.MODE_PRIVATE)
         if (!prefs.getBoolean("hint_longpress", false)) {
@@ -287,6 +316,7 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
             }
         }
         Box(modifier = Modifier.weight(1f)) {
+        key(url, reloadKey) {
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
@@ -296,30 +326,28 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
                     injectJs = injectJs,
                     onPageStartedInject = { w -> w.evaluateJavascript(injectJs, null) },
                     onMainFrameError = { mainFrameError = true },
-                    onNotify = { kind, title, body, key ->
-                        if (kind == "pop") {
-                            lastPopAt = System.currentTimeMillis()
-                            return@createWebView
-                        }
-                        val silent = !BindingStore.soundEnabled(ctx) ||
-                            (Notifier.appInForeground &&
-                                System.currentTimeMillis() - lastPopAt < 2500)
-                        Notifier.alert(ctx, title, body, key, silent)
+                    onNotify = { _, title, body, key, taskId ->
+                        Notifier.alert(ctx, title, body, key, !BindingStore.soundEnabled(ctx), taskId)
                     },
                     onKicked = {
                         kicked = true
                         // 被踢=另一设备占用本配对（relay 单页面规则）。
                         // 停掉保活防止本机后台继续自动重连抢占，把对方反复踢下线。
-                        runCatching { context.stopService(Intent(context, ConnectionService::class.java)) }
+                        ConnectionService.setNeeded(context, false)
                     },
-                    onWebViewRecreated = { reloadKey++ },
+                    onWebViewRecreated = { pageLoaded = false; reloadKey++ },
                     onLongPress = { menuOpen = true },
                     onPageReady = { pageLoaded = true },
                     onCreateAuthWindow = { openAuthDialog() },
                 ).also { webView = it }
             },
+            onRelease = { view ->
+                if (webView === view) webView = null
+                view.destroy()
+            },
             update = { /* URL 变化不重建；由调用方控制 */ },
         )
+        }
 
         // 首帧加载层：主题色背景 + logo + 转圈，避免加载期间白屏
         if (!pageLoaded) {
@@ -426,14 +454,26 @@ private fun createWebView(
     injectJs: String,
     onPageStartedInject: (WebView) -> Unit,
     onMainFrameError: () -> Unit,
-    onNotify: (kind: String, title: String, body: String, key: String) -> Unit,
+    onNotify: (kind: String, title: String, body: String, key: String, taskId: String) -> Unit,
     onKicked: () -> Unit,
     onWebViewRecreated: () -> Unit,
     onLongPress: () -> Unit,
     onPageReady: () -> Unit,
     onCreateAuthWindow: () -> WebView,
 ): WebView {
-    val main = WebView(ctx).apply {
+    if (ctx.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+        WebView.setWebContentsDebuggingEnabled(true)
+    }
+    val main = object : WebView(ctx) {
+        override fun onWindowVisibilityChanged(visibility: Int) {
+            // 工作区收到 hidden 后会主动暂停 relay 心跳。后台提醒开启时维持当前会话。
+            val page = Uri.parse(url.orEmpty())
+            val keepConnected = visibility != VISIBLE && page.host == Uri.parse(initialUrl).host &&
+                BindingStore.keepaliveEnabled(context) &&
+                page.path?.startsWith("/remote/v4") == true
+            super.onWindowVisibilityChanged(if (keepConnected) VISIBLE else visibility)
+        }
+    }.apply {
         layoutParams = ViewGroup.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -468,6 +508,10 @@ private fun createWebView(
         setOnLongClickListener { onLongPress(); true }
 
         webViewClient = object : WebViewClient() {
+            // 部分移动端会在当前窗口导航至授权站点，资源策略须与授权弹窗一致。
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest) =
+                AuthAssets.load(ctx, request)
+
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val u = request.url
                 val scheme = u.scheme?.lowercase()
@@ -513,7 +557,6 @@ private fun createWebView(
 
             override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
                 // 渲染进程崩溃：销毁重建（AndroidView factory 重新执行）
-                view.destroy()
                 Handler(Looper.getMainLooper()).post { onWebViewRecreated() }
                 return true
             }
@@ -638,7 +681,7 @@ private fun SettingsDialog(onDismiss: () -> Unit) {
                             BindingStore.setKeepalive(context, on)
                             // 前台期间不启动服务（无通知）；开启后会在下次退到后台时生效
                             if (!on) {
-                                runCatching { context.stopService(Intent(context, ConnectionService::class.java)) }
+                                ConnectionService.setNeeded(context, false)
                             }
                         },
                     )

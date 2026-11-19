@@ -18,6 +18,83 @@
     try { return window.ZCodeNative || null; } catch (e) { return null; }
   }
 
+  // 系统通知跨越页面重载；用任务 ID 选择行，并等会话实际挂载后才确认打开。
+  var taskNames = window.__zcTaskNames || (window.__zcTaskNames = new Map());
+  function idForBody(body) {
+    var title = String(body || '').replace(/^任务[：:]\s*/, '').trim();
+    var id = '';
+    for (var entry of taskNames) {
+      if (entry[1] !== title || !title) continue;
+      if (id) return ''; // 重名时保留消息详情，避免误开。
+      id = entry[0];
+    }
+    return id;
+  }
+
+  // 两条来源共用同一份短期结果记录。重复注入不会重置它。
+  var results = window.__zcRecentResults || (window.__zcRecentResults = { entries: [], sequence: 0 });
+  function reportResult(source, outcome, title, body, id) {
+    var now = Date.now();
+    results.entries = results.entries.filter(function (e) { return now - e.at < 10000; });
+    var duplicate = results.entries.find(function (e) {
+      if (e.outcome !== outcome) return false;
+      if (id && e.id) return id === e.id;
+      // 网页有时只提供标题。仅与尚未配对的另一来源匹配，避免吞掉同名任务。
+      return body && e.body === body && !e.sources.has(source);
+    });
+    if (duplicate) {
+      duplicate.sources.add(source);
+      if (id) duplicate.id = id;
+      return;
+    }
+    results.entries.push({ at: now, id: id, outcome: outcome, body: body, sources: new Set([source]) });
+    var key = ['result', source, id, outcome, now, ++results.sequence].join('|');
+    bridge()?.notifyTask('task', title, body, key, id);
+  }
+  window.__zcOpenAlert = function (token, id, body) {
+    id = id || idForBody(body);
+    if (!id) return 'detail';
+    var nav = window.__zcAlertNavigation;
+    if (!nav || nav.token !== token) nav = window.__zcAlertNavigation = {token: token};
+    var chat = history.state && history.state.zcodeMobilePage === 'chat';
+    if (chat) {
+      var session = document.querySelector('[data-session-id="' + CSS.escape(id) + '"]');
+      if (session) return 'opened';
+      if (!nav.clicked && !nav.back) {
+        nav.back = true;
+        history.back();
+      }
+      return 'wait';
+    }
+    var row = document.querySelector('[data-testid="' + CSS.escape('task-item-' + id) + '"]');
+    if (row && !row.disabled && !nav.clicked) {
+      nav.clicked = true;
+      row.click();
+      return 'wait';
+    }
+    // 折叠项目和其它列表视图可能没有对应行；使用工作区自己的跨项目搜索。
+    var search = document.querySelector('[data-testid="sidebar-search-open"]');
+    var title = taskNames.get(id) || String(body || '').replace(/^任务[：:]\s*/, '').trim();
+    if (!nav.clicked && search && title && !row) {
+      if (!nav.search) { nav.search = true; search.click(); return 'wait'; }
+      var input = document.querySelector('[cmdk-input]');
+      if (input && !nav.typed) {
+        nav.typed = true;
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, title);
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+      }
+      var results = document.querySelectorAll('[role="option"][data-value^="task-result:"]');
+      for (var result of results) {
+        if (result.getAttribute('data-value').endsWith(':' + id)) {
+          nav.clicked = true;
+          result.click();
+          break;
+        }
+      }
+    }
+    return 'wait';
+  };
+
   /* ---------------- ⓪ Notification 垫片（web 平台通知依赖，越早越好） ----------------
    * 页面 web 模式 showTaskNotification 的实现：
    *   if (!document.hasFocus() && Notification.permission==='granted') new Notification(title,{body})
@@ -35,7 +112,18 @@
         try { b = window.ZCodeNative; } catch (e) {}
         try { console.log('[zc-ntf-ctor] ' + String(title || '') + ' | ' + String(this.body || '')); } catch (e) {}
         if (b) {
-          try { b.notify('task', String(title || ''), String(this.body), 'ntf|' + String(title) + '|' + String(this.body)); } catch (e) {}
+          try {
+            var id = String(options?.data?.taskId || idForBody(this.body));
+            var outcome = title === '任务已完成' ? 'done' : title === '任务出错' ? 'failed' : '';
+            if (outcome && !id) {
+              // 先给携带 ID 的中继帧一个到达机会，保留点击通知时的任务定位。
+              setTimeout(() => reportResult('web', outcome, title, this.body, idForBody(this.body)), 350);
+            } else if (outcome) {
+              reportResult('web', outcome, title, this.body, id);
+            } else {
+              b.notifyTask('task', String(title || ''), this.body, 'ntf|' + title + '|' + this.body, id);
+            }
+          } catch (e) {}
         }
         this.close = function () {};
         this.onclick = null;
@@ -60,7 +148,7 @@
   }
 
   /* ---------------- ⓪-b WebSocket 嗅探（任务完成/失败主通道） ----------------
-   * 页面自身通知管线在移动 web 构建里不触发（实测），改为直接观察 relay WS 数据帧：
+   * 中继任务状态和网页通知可能同时送达，均交给 reportResult：
    * workspace-list-updated 等帧内含 sessions[{sessionId, phase, title}]，
    * phase: completedSuccess / completedInterrupted / error。
    * 维护 sessionId→phase 映射，相位跃迁到完成/失败 → 原生通知。 */
@@ -69,15 +157,8 @@
     try {
       var OrigWS = window.WebSocket;
       var lastPhase = {};
+      var taskVersions = new Map();
       var seenTypes = {};
-
-      function zcSend(title, body, key) {
-        try {
-          var b = window.ZCodeNative;
-          if (b) b.notify('task', String(title || ''), String(body || ''), String(key || ''));
-        } catch (e) {}
-        try { console.log('[zc-notify] ' + title + ' | ' + body); } catch (e) {}
-      }
 
       function isDone(ph) {
         return ph === 'completedSuccess' || ph === 'completedInterrupted' ||
@@ -88,13 +169,17 @@
       }
 
       function notePhase(taskId, ph, name) {
+        if (name) taskNames.set(taskId, name);
         var prev = lastPhase[taskId];
         lastPhase[taskId] = ph;
         if (prev === undefined || prev === ph) return; // 首见只做基线，不打扰
-        if (isDone(ph)) {
-          zcSend('任务已完成', name ? ('任务：' + name) : '', 'ws|' + taskId + '|' + ph);
-        } else if (isFail(ph)) {
-          zcSend('任务出错', name ? ('任务：' + name) : '', 'ws|' + taskId + '|' + ph);
+        var body = name ? ('任务：' + name) : '';
+        if (isDone(ph) && !isDone(prev)) {
+          reportResult('relay', 'done', '任务已完成', body, taskId);
+        } else if (isFail(ph) && !isFail(prev)) {
+          reportResult('relay', 'failed', '任务出错', body, taskId);
+        } else if (ph === 'running' && (isDone(prev) || isFail(prev))) {
+          results.entries = results.entries.filter(function (e) { return e.id !== taskId; });
         }
       }
 
@@ -110,11 +195,16 @@
         if (meta && typeof meta.taskId === 'string' &&
             (act && typeof act.phase === 'string' || typeof obj.liveStatus === 'string')) {
           var ph2 = (act && act.phase) || obj.liveStatus;
-          notePhase(meta.taskId, ph2, meta.title || '');
+          var version = Number(act?.lastActivityAt || meta.updatedAt || 0);
+          var previousVersion = taskVersions.get(meta.taskId) || 0;
+          if (!version || version >= previousVersion) {
+            taskVersions.set(meta.taskId, version || previousVersion);
+            notePhase(meta.taskId, ph2, meta.title || '');
+          }
         }
         // 兼容旧 schema：{sessionId, phase, title}
         var sid = obj.sessionId || obj.session_id;
-        if (typeof sid === 'string' && typeof obj.phase === 'string') {
+        if (typeof sid === 'string' && typeof obj.phase === 'string' && !taskVersions.has(sid)) {
           notePhase(sid, obj.phase, obj.title || obj.name || '');
         }
         for (var k in obj) {
@@ -229,28 +319,16 @@
     } catch (e) {}
   }
 
-  /* ---------------- ① Audio 钩子（只装一次，越早越好） ---------------- */
-  if (!window.__zcAudioHooked) {
+  // 网页会缓存 Audio 并反复 play()。任务提示音由系统通知通道统一播放。
+  if (!window.__zcAudioHooked && window.HTMLMediaElement) {
     window.__zcAudioHooked = true;
-    try {
-      var OrigAudio = window.Audio;
-      if (typeof OrigAudio === 'function') {
-        var Hooked = function (url) {
-          try {
-            if (String(url || '').indexOf('task-notification-pop') !== -1) {
-              window.__zcPopAt = Date.now();
-              try {
-                var b0 = bridge();
-                if (b0) b0.notify('pop', '', '', 'pop|' + Math.floor(Date.now() / 5000));
-              } catch (e) {}
-            }
-          } catch (e) {}
-          return new OrigAudio(url);
-        };
-        Hooked.prototype = OrigAudio.prototype;
-        window.Audio = Hooked;
-      }
-    } catch (e) {}
+    var media = window.HTMLMediaElement.prototype;
+    var play = media.play;
+    media.play = function () {
+      var path = (this.currentSrc || this.src || '').split(/[?#]/, 1)[0];
+      if (/(?:^|\/)task-notification-pop(?:-[\w-]+)?\.mp3$/i.test(path)) return Promise.resolve();
+      return play.apply(this, arguments);
+    };
   }
 
   /* ---------------- ② MutationObserver（已存在则整个脚本跳过） ---------------- */
@@ -267,12 +345,12 @@
     return false;
   }
 
-  function send(kind, title, body, key, windowMs) {
+  function send(kind, title, body, key, windowMs, taskId) {
     var b = bridge();
     if (!b) return;
     var k = key || (kind + '|' + (title || '') + '|' + (body || ''));
     if (isDup(k, windowMs)) return;
-    try { b.notify(String(kind), String(title || ''), String(body || ''), String(k)); } catch (e) {}
+    try { b.notifyTask(String(kind), String(title || ''), String(body || ''), String(k), taskId || ''); } catch (e) {}
   }
 
   var TID_DIALOG = 'v4-user-input-dialog';
@@ -394,7 +472,9 @@
 
     if (tid === TID_DIALOG) {
       // 权限 / 输入请求模态（fixed inset-0 z-[100]）
-      send('input', '需要你的确认', textOf(node, 200), 'dialog|' + Math.floor(Date.now() / 8000), 8000);
+      var owner = node.closest('[data-session-id]') || document.querySelector('[data-session-id]');
+      send('input', '需要你的确认', textOf(node, 200), 'dialog|' + Math.floor(Date.now() / 8000), 8000,
+        owner && owner.getAttribute('data-session-id'));
       return;
     }
     if (tid && TID_BADGES.indexOf(tid) !== -1) {
@@ -405,8 +485,7 @@
     var t = textOf(node, 160);
     if (!t) return;
 
-    // 任务完成/失败类通知已由 ⓪ Notification 垫片全覆盖（hasFocus 恒 false 后必然触发），
-    // 此处不再做文案匹配，避免双重通知。仅保留被踢检测。
+    // 完成和失败由中继或网页通知上报，此处只检测被踢提示。
     for (var i = 0; i < KICK_TEXTS.length; i++) {
       if (t.indexOf(KICK_TEXTS[i]) !== -1) {
         try { bridge() && bridge().onKicked(); } catch (e) {}

@@ -1,8 +1,11 @@
 package com.autosquare.zcode.mobile.service
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.IBinder
+import android.util.Log
+import androidx.core.content.ContextCompat
 import com.autosquare.zcode.mobile.data.BindingStore
 import com.autosquare.zcode.mobile.notify.Notifier
 import com.autosquare.zcode.mobile.notify.startForegroundCompat
@@ -13,16 +16,45 @@ import com.autosquare.zcode.mobile.notify.startForegroundCompat
  */
 class ConnectionService : Service() {
 
+    companion object {
+        // Activity 和 Service 生命周期都在主线程。启动请求在系统投递前不能被 stopService 取消。
+        private var wanted = false
+        private var starting = false
+        private var running: ConnectionService? = null
+
+        fun setNeeded(context: Context, needed: Boolean) {
+            wanted = needed
+            if (!needed) {
+                running?.stopSelf()
+                running = null
+            } else if (!starting && running == null) {
+                starting = true
+                try {
+                    ContextCompat.startForegroundService(context, Intent(context, ConnectionService::class.java))
+                } catch (e: RuntimeException) {
+                    starting = false
+                    Log.w("ZCodeConnection", "系统未允许启动后台连接服务", e)
+                }
+            }
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Notifier.ensureChannels(this)
-        if (!BindingStore.keepaliveEnabled(this) || BindingStore.boundUrl(this) == null) {
-            stopSelf()
-            return START_NOT_STICKY
-        }
         startForegroundCompat(this, Notifier.KEEPALIVE_NOTIFICATION_ID, Notifier.keepaliveNotification(this))
-        return START_STICKY
+        starting = false
+        running = this
+        if (!wanted || !BindingStore.keepaliveEnabled(this) || BindingStore.boundUrl(this) == null) {
+            setNeeded(this, false)
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        if (running === this) running = null
+        super.onDestroy()
     }
 
     /**
@@ -31,7 +63,7 @@ class ConnectionService : Service() {
      * 把用户当前正在用的另一台设备踢下线（「幽灵占用」）。
      */
     override fun onTaskRemoved(rootIntent: Intent?) {
-        stopSelf()
+        setNeeded(this, false)
         super.onTaskRemoved(rootIntent)
     }
 }

@@ -7,14 +7,19 @@ import android.webkit.JavascriptInterface
  * 回调统一抛回主线程处理。
  */
 class NativeBridge(
-    private val onNotify: (kind: String, title: String, body: String, dedupeKey: String) -> Unit,
+    private val onNotify: (kind: String, title: String, body: String, dedupeKey: String, taskId: String) -> Unit,
     private val onKicked: () -> Unit,
 ) {
 
     @JavascriptInterface
     fun notify(kind: String, title: String, body: String, dedupeKey: String) {
+        notifyTask(kind, title, body, dedupeKey, "")
+    }
+
+    @JavascriptInterface
+    fun notifyTask(kind: String, title: String, body: String, dedupeKey: String, taskId: String) {
         android.os.Handler(android.os.Looper.getMainLooper()).post {
-            onNotify(kind, title, body, dedupeKey)
+            onNotify(kind, title, body, dedupeKey, taskId)
         }
     }
 

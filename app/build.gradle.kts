@@ -1,10 +1,26 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
 
+// 发布签名：key.properties 与 *.jks 均在 .gitignore 中（密钥不入库）
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("key.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
 android {
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file((keystoreProps["storeFile"] as String?) ?: "zcode-mobile.jks")
+            storePassword = keystoreProps["storePassword"] as String?
+            keyAlias = keystoreProps["keyAlias"] as String?
+            keyPassword = keystoreProps["keyPassword"] as String?
+        }
+    }
     namespace = "com.autosquare.zcode.mobile"
     compileSdk = 34
 
@@ -21,6 +37,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

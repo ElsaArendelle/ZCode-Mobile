@@ -18,12 +18,12 @@
 | 项 | 说明 |
 |---|---|
 | 设计稿归档 | `docs/assets/app-icon-source.png`（方形）、`docs/assets/app-icon-round-source.png`（圆形） |
-| 生成脚本 | `.debug/gen_round.ps1`（PowerShell + System.Drawing，无第三方依赖） |
-| 自适应图标 | `res/mipmap-anydpi-v26/ic_launcher(.round).xml`：background=`@mipmap/ic_launcher_background`，foreground=透明 |
-| 背景层 | `res/mipmap-*/ic_launcher_background.png`：圆形设计稿缩至 **66%** 居中（安全区：更大的比例会被启动器/系统闪屏的圆形遮罩裁掉右下角机器人徽标） |
-| 启动闪屏 | `values-v31` / `values-night-v31`：底色 `@color/window_bg`（跟随系统深/浅），图标 `@mipmap/ic_launcher_round` |
+| 普通图标 | `ic_launcher.xml` 使用铺满图层的深灰底色，由系统裁出圆形或方形轮廓。透明前景取自方形稿，白色 Z 居中，机器人位于右下角。 |
+| 圆形入口 | `android:roundIcon` 指向 `ic_launcher_round`，在同色实底上叠加圆稿。部分圆形桌面及系统设置页会直接裁切普通图标。 |
+| 生成脚本 | 在仓库根目录运行 `scripts/build-launcher-icons.ps1`，从方形原稿生成各密度的普通图标和自适应前景。 |
+| 启动闪屏 | 浅色和深色主题均通过 `android:windowSplashScreenAnimatedIcon` 使用带透明留白的完整圆标位图 `@mipmap/ic_launcher_background`。窗口底色随 `@color/window_bg` 切换。桌面图标的深色底板独立于透明的 Z 和机器人前景。 |
 | 加载层 | WebView `onPageFinished` 前显示主题底色 + logo + 转圈，替代加载期白屏 |
-| 旧版回退 | `res/mipmap-*/ic_launcher(.round).png` 同上参数 |
+| 位图回退 | 各密度的 `ic_launcher.png` 使用方稿，`ic_launcher_round.png` 使用圆稿。 |
 
 ## 架构
 
@@ -43,14 +43,14 @@ MainActivity (singleTask)
      │    │   二进制帧头 + JSON。解码后 topic=controller/tasks-index，
      │    │   deltas[].task.meta{taskId,title} + task.activity.phase（running/completedSuccess/error）。
      │    │   维护 taskId→phase，相位跃迁到完成/失败 → 原生通知（首见只做基线，避免历史任务刷屏）。
-     │    │   实测日志：`[zc-notify] 任务已完成 | 任务：…` + 系统通知 posted。
+     │    │   同一任务优先使用任务索引的活动时间与状态，忽略滞后的旧版会话状态。
      │    ├─ ⓪ window.Notification 垫片（兜底）：页面 web 模式 showTaskNotification 的实现是
      │    │   `if (!document.hasFocus() && Notification.permission==='granted') new Notification(title,{body})`，
      │    │   WebView 里该 API 恒为 denied → 页面通知永不触发。垫片伪装 granted 并把
      │    │   new Notification(...) 转交 ZCodeNative → 系统通知 + 官方提示音。
      │    │   注意：官方 HTTP 推送（/remote/notification/events，给官方 App 的系统推送）
      │    │   对网页客户端回执 rejected——网页端通知只能走页面内 Notification 路径。
-     │    ├─ 包装 window.Audio：页面播 task-notification-pop-*.mp3 → pop 事件（页面自发提示音信号）
+     │    ├─ 在媒体 play() 时识别并静音网页的 task-notification-pop 音频，任务铃声由 Android 通知通道负责。
      │    ├─ MutationObserver（childList + characterData）：
      │    │     data-testid="v4-user-input-dialog"           → 权限/输入请求
      │    │     v4-workspace-hook/mcp-pending-unread          → 待审批未读徽标
@@ -73,13 +73,21 @@ ConnectionService (前台服务 specialUse)
 
 ### 通知三通道（notify/Notifier.kt）
 
+开启后台提醒后，主工作区 WebView 在窗口隐藏时保持可见性，避免移动页主动暂停中继心跳。授权窗口保持系统默认行为。Activity 在退后台时请求连接服务，服务收到启动命令后先调用 `startForeground`，再核对当前是否仍须运行。快速切回前台或关闭提醒时，待投递的启动命令仍能完成系统要求的前台服务登记。进程被系统终止后，单独重建服务无法恢复 WebView 会话。
+
+任务事件从中继帧携带 `taskId` 到 Android，系统通知各自持有独立的不可变 PendingIntent。点击后等待工作区就绪，按任务 ID 打开列表项。目标行折叠时，通过工作区搜索按 ID 核对结果；已打开其他会话时先返回任务列表。页面显示匹配的会话 ID 后结束定位。无目标或目标不可用时显示原通知内容。静默的连接通知仍用于返回应用。
+
+回归检查可运行 `node tests/task-notifications.mjs`。真机验收时先打开任务 A，再回到 Android 桌面，让电脑完成任务 B。先在手机通知栏确认收到 B 的提醒，再点通知核对会话标题及最新回复。2026-11-20 已在华为 JEF-AN00 的 Release 包跑通这条路径。
+
 | Channel | 用途 | 声音 |
 |---|---|---|
 | `keepalive` | 前台服务常驻 | 无（IMPORTANCE_LOW） |
 | `alerts` | 任务提醒 | `res/raw/task_notification_pop.mp3`（提取自 ZCode 桌面端安装包，官方同款提示音）+ 震动 |
-| `alerts_silent` | App 在前台且页面已自发提示音（pop 后 2.5s 内） | 无，避免双重响铃 |
+| `alerts_silent` | App 内关闭「提醒声音」时的任务通知 | 无 |
 
-按 `dedupeKey` 做 10 秒窗口去重；`settings.sound_enabled=false` 时走 silent 通道。
+中继状态变化和网页 Notification 都可能报告一次任务结束。`inject.js` 按任务 ID 和完成／失败结果在 10 秒内合并，重新进入 running 后开启下一轮。网页只给出标题时短暂等待中继，再用 ID 或未配对的同名结果匹配。两个不同 ID 的同名任务分别提醒。Android 端仍按 `dedupeKey` 在 10 秒内去重；关闭提醒声音时使用静默通道。
+
+熄屏验收时，同时检查 Android 的 `notification_enqueue` 事件和 `dumpsys audio` 的音频焦点记录。华为真机曾在同一条提醒后先出现系统的 `USAGE_NOTIFICATION`，约一秒后又出现 WebView 的 `USAGE_MEDIA`。修复后，同轮实测只有一次任务通知入队和一次系统通知音频请求。
 
 ## 依据的关键逆向事实（来自桌面 app.asar，2026-11）
 
@@ -102,7 +110,7 @@ JAVA_HOME="C:\Program Files\Android\Android Studio\jbr" ./gradlew.bat installDeb
 
 ## 登录与模拟器验证
 
-授权窗口在顶栏下显示加载进度条。主文档或登录所需脚本、样式请求失败时才出现错误提示与「重新加载」。部分网络下载官方 CDN 的入口脚本会出现 HTTP/2 流错误；AuthAssets 仅对授权窗口中 z-cdn.chatglm.cn 的公开前端脚本和样式使用 HTTPS 上的 HTTP/1.1，完整读取后交给 WebView。用户在官方页面确认授权后，客户端关闭授权窗口，主页面继续轮询并保存登录状态。授权过期后可从登录页重新发起。
+授权窗口在顶栏下显示加载进度条。主文档或登录所需脚本、样式请求失败时才出现错误提示与「重新加载」。部分网络下载官方 CDN 的入口脚本会出现 HTTP/2 流错误；官方移动页可能在主窗口直接跳转，也可能打开独立授权窗口。两种路径共用 AuthAssets，仅对 z-cdn.chatglm.cn 的公开前端脚本和样式使用 HTTPS 上的 HTTP/1.1，完整读取后交给 WebView。客户端按 HTTP 缓存规则复用资源，读取超时为 30 秒，单次请求上限为 55 秒；失败时回退到 WebView 的网络栈。用户在官方页面确认授权后，客户端关闭授权窗口，主页面继续轮询并保存登录状态。授权过期后可从登录页重新发起。
 
 在已绑定并安装 debug 包的测试模拟器上运行 `node tests/oauth-webview.mjs`，可检查授权返回和重复登录时主页面状态是否保留。测试会重启测试应用。
 

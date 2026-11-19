@@ -14,6 +14,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.autosquare.zcode.mobile.data.BindingStore
 import com.autosquare.zcode.mobile.notify.Notifier
+import com.autosquare.zcode.mobile.notify.TaskAlert
+import com.autosquare.zcode.mobile.service.ConnectionService
 import com.autosquare.zcode.mobile.ui.ScanScreen
 import com.autosquare.zcode.mobile.ui.WebScreen
 
@@ -21,6 +23,7 @@ class MainActivity : ComponentActivity() {
 
     private val rescanFlag = mutableStateOf(false)
     private val boundUrl = mutableStateOf<String?>(null)
+    private val pendingAlert = mutableStateOf<TaskAlert?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,26 +42,23 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        Notifier.setForeground(true)
         // 回到前台：进程已在前台，不需要保活服务 → 撤掉常驻通知
-        runCatching { stopService(Intent(this, com.autosquare.zcode.mobile.service.ConnectionService::class.java)) }
+        ConnectionService.setNeeded(this, false)
     }
 
     override fun onPause() {
-        Notifier.setForeground(false)
         // 退到后台：为保住 WebSocket 连接（锁屏/切走后仍能收到任务提醒）才启动前台服务
         if (BindingStore.keepaliveEnabled(this) && BindingStore.boundUrl(this) != null) {
-            runCatching {
-                androidx.core.content.ContextCompat.startForegroundService(
-                    this,
-                    Intent(this, com.autosquare.zcode.mobile.service.ConnectionService::class.java),
-                )
-            }
+            ConnectionService.setNeeded(this, true)
         }
         super.onPause()
     }
 
     private fun handleIntent(intent: Intent?) {
+        if (intent != null && intent.action == Notifier.ACTION_TASK) {
+            pendingAlert.value = Notifier.taskFrom(this, intent)
+            rescanFlag.value = false
+        }
         if (intent?.getBooleanExtra(Notifier.EXTRA_RESCAN, false) == true) {
             rescanFlag.value = true
         }
@@ -87,7 +87,12 @@ class MainActivity : ComponentActivity() {
                         rescanFlag.value = false
                     },
                 )
-                else -> WebScreen(url = url, onNeedRescan = { rescanFlag.value = true })
+                else -> WebScreen(url, pendingAlert.value, onAlertHandled = { handled ->
+                    if (pendingAlert.value?.token == handled.token) {
+                        pendingAlert.value = null
+                        intent.action = null
+                    }
+                }, onNeedRescan = { rescanFlag.value = true })
             }
         }
     }

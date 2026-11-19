@@ -13,12 +13,16 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.autosquare.zcode.mobile.MainActivity
 import com.autosquare.zcode.mobile.R
+import com.autosquare.zcode.mobile.data.BindingStore
+import java.util.UUID
+
+data class TaskAlert(val token: String, val taskId: String, val title: String, val body: String, val sameBinding: Boolean)
 
 /**
  * 通知中枢。三个 channel：
  * - keepalive：前台服务常驻通知，IMPORTANCE_LOW 静默（模式平移自 01-GeoBuild-Mobile/AssistService.kt）
  * - alerts：任务提醒，系统提示音（提取自 ZCode 桌面端的 task-notification-pop.mp3）+ 震动
- * - alerts_silent：App 在前台且页面已自行播放过提示音时，补发系统通知但不再响铃
+ * - alerts_silent：关闭「提醒声音」后的任务通知
  */
 object Notifier {
 
@@ -29,18 +33,10 @@ object Notifier {
 
     const val KEEPALIVE_NOTIFICATION_ID = 7
     const val ACTION_RESCAN = "com.autosquare.zcode.mobile.RESCAN"
+    const val ACTION_TASK = "com.autosquare.zcode.mobile.OPEN_TASK"
 
     private const val DEDUPE_WINDOW_MS = 10_000L
     private val recentKeys = LinkedHashMap<String, Long>()
-
-    /** App 是否在前台（MainActivity onResume/onPause 维护）。 */
-    @Volatile
-    var appInForeground: Boolean = false
-        private set
-
-    fun setForeground(fg: Boolean) {
-        appInForeground = fg
-    }
 
     fun ensureChannels(context: Context) {
         val nm = context.getSystemService(NotificationManager::class.java) ?: return
@@ -92,10 +88,10 @@ object Notifier {
             .build()
 
     /**
-     * 发任务提醒。silent=true 时走无音 channel（页面自己已响过提示音的场景）。
+     * 发任务提醒。silent=true 时使用静默通道。
      * 按 dedupeKey 在 [DEDUPE_WINDOW_MS] 内去重。
      */
-    fun alert(context: Context, title: String, body: String, dedupeKey: String, silent: Boolean) {
+    fun alert(context: Context, title: String, body: String, dedupeKey: String, silent: Boolean, taskId: String) {
         if (title.isBlank() && body.isBlank()) return
         val now = System.currentTimeMillis()
         synchronized(recentKeys) {
@@ -114,26 +110,38 @@ object Notifier {
         if (!hasNotificationPermission(context)) return
 
         val channel = if (silent) CHANNEL_ALERTS_SILENT else CHANNEL_ALERTS
+        val token = UUID.randomUUID().toString()
+        val open = Intent(context, MainActivity::class.java).apply {
+            action = ACTION_TASK
+            identifier = token
+            putExtra("taskId", taskId)
+            putExtra("title", title)
+            putExtra("body", body)
+            putExtra("binding", BindingStore.boundUrl(context)?.hashCode() ?: 0)
+        }
         val notification = NotificationCompat.Builder(context, channel)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title.ifBlank { context.getString(R.string.app_name) })
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body.ifBlank { title }))
-            .setContentIntent(mainActivityIntent(context, null))
+            .setContentIntent(PendingIntent.getActivity(context, 0, open, PendingIntent.FLAG_IMMUTABLE))
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_EVENT)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOnlyAlertOnce(true)
             .build()
-        notifySafely(context, (System.currentTimeMillis() and 0x7FFFFFFF).toInt(), notification)
+        try {
+            context.getSystemService(NotificationManager::class.java)?.notify(token, 0, notification)
+        } catch (_: SecurityException) {
+            // 通知权限可能在构建通知期间被撤回。
+        }
     }
 
-    private fun notifySafely(context: Context, id: Int, notification: Notification) {
-        try {
-            context.getSystemService(NotificationManager::class.java)?.notify(id, notification)
-        } catch (_: SecurityException) {
-            // 用户拒绝了通知权限；静默放弃
-        }
+    fun taskFrom(context: Context, intent: Intent): TaskAlert? {
+        if (intent.action != ACTION_TASK || intent.identifier == null) return null
+        val sameBinding = intent.getIntExtra("binding", 0) == BindingStore.boundUrl(context)?.hashCode()
+        return TaskAlert(intent.identifier!!, if (sameBinding) intent.getStringExtra("taskId").orEmpty() else "",
+            intent.getStringExtra("title").orEmpty(), intent.getStringExtra("body").orEmpty(), sameBinding)
     }
 
     /** 前台服务常驻通知（静默 + ongoing），带「重新扫码」动作。 */
