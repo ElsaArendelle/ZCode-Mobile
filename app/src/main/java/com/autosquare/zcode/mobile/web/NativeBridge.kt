@@ -9,16 +9,7 @@ import android.webkit.JavascriptInterface
 class NativeBridge(
     private val onNotify: (kind: String, title: String, body: String, dedupeKey: String) -> Unit,
     private val onKicked: () -> Unit,
-    private val onOpenAuth: (String) -> Unit,
 ) {
-
-    /** OAuth 授权页：页面 window.open 授权 URL → 独立 Activity 打开（避免 WebView 叠层白屏）。 */
-    @JavascriptInterface
-    fun openAuth(url: String) {
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            onOpenAuth(url)
-        }
-    }
 
     @JavascriptInterface
     fun notify(kind: String, title: String, body: String, dedupeKey: String) {

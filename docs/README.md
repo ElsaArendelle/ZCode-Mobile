@@ -34,13 +34,8 @@ MainActivity (singleTask)
  │               （无相机权限也可从相册绑定；截图识别实测通过）
  └─ WebScreen    系统 WebView (Chrome 内核)
      ├─ 白名单导航：zcode.z.ai / zcode.chatglm.site / bigmodel.cn / dev.bigmodel.cn / chat.z.ai / zchat.z.ai / api.z.ai
-     ├─ OAuth 登录（独立 Activity，实测闭环）：
-     │    SPA 点登录 → POST /api/v1/oauth/cli/init（flow_id）→ window.open(authorize_url)
-     │    → inject.js 拦截 window.open（授权域名）+ WebChromeClient.onCreateWindow 兜底捕获 URL
-     │    → 两种路径都 startActivity(OAuthActivity) —— 独立窗口渲染（Compose 内嵌第二个 WebView 会白屏）
-     │    → 用户完成授权 → 回调 URL 命中 → OAuthActivity 自动 finish
-     │    → 主 SPA 轮询 /api/v1/oauth/cli/poll/<flow_id> 拿 JWT（status: ready）→ oauth:browser_session 落 localStorage
-     │    （主 SPA 不可被导航顶替——轮询方死了令牌就丢）
+     ├─ OAuth 登录：WebChromeClient.onCreateWindow 把独立授权窗口内的 WebView 交给 Chromium。
+     │    服务端处理回调，主页面保持打开并轮询登录结果。
      ├─ zcode:// 深链拦截（桌面 OAuth 回调，壳内不放行）
      ├─ inject.js（只读观察，零改动页面）
      │    ├─ ⓪-b **WebSocket 帧嗅探（任务完成/失败主通道，已实测闭环）**：
@@ -63,6 +58,8 @@ MainActivity (singleTask)
      │    │     文本命中 重新生成二维码/被踢出 → onKicked（引导重扫）
      │    └─ TEXT_REPLACEMENTS 文案替换 + 登录页原生化（见下）
      └─ NativeBridge (window.ZCodeNative) → Notifier
+
+顶部工具栏的刷新与设置使用 24dp 线框矢量图标，随主题着色。两个按钮保留 Material 的触控区域，并分别向读屏服务提供“刷新页面”和“设置”标签。
 
 菜单交互（重要设计）：**无悬浮按钮**——页面是全屏沉浸 SPA，任何悬浮元素都会与页面 header 重叠挡点击。
 菜单=长按屏幕任意处唤出（WebView.setOnLongClickListener 拦截，替换默认文本选择）；
@@ -103,22 +100,13 @@ JAVA_HOME="C:\Program Files\Android\Android Studio\jbr" ./gradlew.bat installDeb
 - **模拟器无相机扫码场景**：可用 `adb shell run-as com.autosquare.zcode.mobile` 直接写 `shared_prefs/zcode_binding.xml` 注入绑定 URL（桌面端二维码旁有「复制链接」按钮）。
 - 通知日志：`adb logcat | grep -i notif`；桥接事件走 Notifier（无独立日志），排查时在 `NativeBridge.notify` 加断点。
 
-## 登录自动化（v16:5x 起）
+## 登录与模拟器验证
 
-服务端 OAuth flow 有效期约 60 秒。核心对策：**授权窗打开期间每 40 秒静默续期**
-（主页面重新 init，新授权页由隐藏 WebView 承载；zchat 未登录时停在登录表单无副作用，
-用户输完验证码完成授权时对应的正是最新 flow）→ 首次输码再慢也直接成功。
-辅助自动化（兜底，实测闭环）：
+授权窗口在顶栏下显示加载进度条。主文档或登录所需脚本、样式请求失败时才出现错误提示与「重新加载」。部分网络下载官方 CDN 的入口脚本会出现 HTTP/2 流错误；AuthAssets 仅对授权窗口中 z-cdn.chatglm.cn 的公开前端脚本和样式使用 HTTPS 上的 HTTP/1.1，完整读取后交给 WebView。用户在官方页面确认授权后，客户端关闭授权窗口，主页面继续轮询并保存登录状态。授权过期后可从登录页重新发起。
 
-1. **授权确认自动完成**：授权页出现「协议勾选 + 继续」（非登录表单）时自动勾选并点继续——
-   用户唯一手工步骤是输手机号 + 验证码（Toast 提示「已自动确认授权」）。
-2. **衔接遮罩**：授权回调受理后（Dialog 关闭）立即盖「正在完成登录…」遮罩，红字失败态永不可见；
-   每 600ms 检查主页面：拿到 `oauth:browser_session` → 撤遮罩进工作区。
-3. **超时自动重授权（静默）**：遮罩期间检测到「授权流程未完成」→ 自动重点登录 → 新授权 URL 由
-   **隐藏 WebView（0x0 容器）**加载并自动确认（不弹任何窗口，授权页全程只出现一次）→
-   poll ready → 撤遮罩。重试上限 2 次，防死循环。
+在已绑定并安装 debug 包的测试模拟器上运行 `node tests/oauth-webview.mjs`，可检查授权返回和重复登录时主页面状态是否保留。测试会重启测试应用。
 
-用户手动返回授权页（未回调）不触发监测，不打扰。
+本机切换 VPN 后若模拟器无法解析域名，可先关闭该 AVD，再运行 `.\scripts\start-emulator.ps1`。脚本使用当前以太网实测可达的 DNS 202.98.18.3。更换网络后可通过 `-DnsServer` 指定新网络可达的 DNS。该选项只对本次模拟器启动生效。
 
 ## 已知边界
 

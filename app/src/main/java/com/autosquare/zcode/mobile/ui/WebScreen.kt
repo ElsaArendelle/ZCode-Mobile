@@ -59,13 +59,14 @@ import com.autosquare.zcode.mobile.R
 import com.autosquare.zcode.mobile.data.BindingStore
 import com.autosquare.zcode.mobile.notify.Notifier
 import com.autosquare.zcode.mobile.service.ConnectionService
+import com.autosquare.zcode.mobile.web.AuthAssets
 import com.autosquare.zcode.mobile.web.NativeBridge
 
 private const val TAG = "ZCodeWeb"
 
 /**
  * 工作区屏：系统 WebView（Chrome 内核）加载移动页。
- * - 无外壳：无地址栏/无标签页；window.open 一律路由回本 WebView（OAuth 全程 App 内跳转）
+ * - 无外壳：无地址栏/无标签页；window.open 由独立授权窗口承载（OAuth 全程 App 内完成）
  * - 白名单：仅放行 ZCode/OAuth 相关域的导航，zcode:// 深链拦截
  * - 通知：inject.js 观察页面通知载体 → NativeBridge → Notifier
  */
@@ -94,263 +95,130 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
     // 首帧加载态：页面 onPageFinished 前显示 logo + 转圈，替代白屏
     var pageLoaded by remember { mutableStateOf(false) }
 
-    // 首次授权超时后自动重走授权时，用遮罩盖住页面上的「授权流程未完成」红字
-    var authRetrying by remember { mutableStateOf(false) }
-
-    // OAuth 授权页：用 Dialog 窗口承载（不是 Activity）。
-    // 关键：Activity 被覆盖会暂停/节流主 WebView，页面轮询停摆 → 服务端 flow 过期 → 「授权流程未完成」。
-    // Dialog 只是窗口叠加，主 Activity 保持 RESUMED，轮询持续。
-    // 二次授权静默化：自动重登录不再弹窗（隐藏 WebView 完成），授权页只出现一次
-    val silentRelogin = remember { mutableStateOf(false) }
-    // 授权窗开着期间（用户正在输验证码），一切新授权 URL 一律静默承载——
-    // 续期跳转有两条拦截路径，一次性标志会被第一条吃掉导致第二条弹可见窗
-    val authDialogActive = remember { mutableStateOf(false) }
-    val reloginCount = remember { mutableStateOf(0) }
-
-    fun maybeRelogin() {
-        if (reloginCount.value < 2) {
-            reloginCount.value++
-            silentRelogin.value = true
-            // 等待态没有「登录」按钮（只有「取消」）：先取消等待，再发起登录
-            webView?.evaluateJavascript(
-                "(function(){var c=[...document.querySelectorAll('button')].find(" +
-                    "function(x){return x.textContent.trim()==='取消'&&!x.disabled;});" +
-                    "if(c)c.click();return 'ok';})()", null,
-            )
-            webView?.postDelayed({
-                webView?.evaluateJavascript(
-                    "(function(){var b=[...document.querySelectorAll('button')].find(" +
-                        "function(x){return x.textContent.trim()==='登录'&&!x.disabled;});" +
-                        "if(b){b.click();return 'retry';}return 'nobtn';})()",
-                ) { r -> Log.i(TAG, "maybeRelogin click: $r") }
-            }, 800)
-        } else {
-            authRetrying = false
+    // 授权窗口始终独立承载，主页面保留发起授权时的轮询与状态。
+    fun openAuthDialog(): WebView {
+        val dialog = android.app.Dialog(context, android.R.style.Theme_Material_Light_NoActionBar)
+        val dp = context.resources.displayMetrics.density
+        val pad = (14 * dp).toInt()
+        val status = android.widget.TextView(context).apply {
+            visibility = android.view.View.GONE
+            setTextColor(android.graphics.Color.DKGRAY)
+            setPadding(pad, pad, pad, pad)
         }
-    }
+        val retry = android.widget.Button(context).apply {
+            text = "重新加载"
+            visibility = android.view.View.GONE
+        }
+        val progress = android.widget.ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = true
+            contentDescription = "正在加载授权页面"
+        }
+        var failed = false
+        val aw = WebView(context).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            settings.useWideViewPort = true
+            setBackgroundColor(android.graphics.Color.WHITE)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+        }
+        fun showError(message: String) {
+            failed = true
+            progress.visibility = android.view.View.GONE
+            status.text = message
+            status.visibility = android.view.View.VISIBLE
+            retry.visibility = android.view.View.VISIBLE
+        }
+        aw.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(v: WebView, request: WebResourceRequest) =
+                AuthAssets.load(request)
 
-    fun startPairWatch() {
-        authRetrying = true
-        var attempts = 0
-        val checker = object : Runnable {
-            override fun run() {
-                attempts++
-                if (attempts > 40) {
-                    authRetrying = false
-                    return
-                }
-                webView?.evaluateJavascript(
-                    "(function(){var k=Object.keys(localStorage);" +
-                        "if(k.indexOf('oauth:browser_session')!==-1)return 'paired';" +
-                        "var t=document.body.innerText||'';" +
-                        "if(t.indexOf('授权流程未完成')!==-1)return 'failed';" +
-                        "return 'waiting';})()",
-                ) { r ->
-                    when {
-                        r == null -> authRetrying = false
-                        r.contains("paired") -> authRetrying = false
-                        // 授权已完成却还没拿到会话：8 秒即主动发起新一轮
-                        // （页面自己的 60 秒超时太慢；此时 zchat 已登录，新一轮秒完成）
-                        r.contains("waiting") && attempts >= 13 -> {
-                            maybeRelogin()
-                            webView?.postDelayed(this, 1200)
-                        }
-                        r.contains("failed") -> {
-                            maybeRelogin()
-                            webView?.postDelayed(this, 1200)
-                        }
-                        else -> webView?.postDelayed(this, 600)
-                    }
-                }
+            override fun onPageCommitVisible(v: WebView, url: String) {
+                if (!failed) progress.visibility = android.view.View.GONE
             }
-        }
-        webView?.postDelayed(checker, 600)
-    }
 
-    fun makeAuthClient(aw: android.webkit.WebView, hadCallback: BooleanArray, quiet: Boolean, onDone: () -> Unit): android.webkit.WebViewClient =
-        object : android.webkit.WebViewClient() {
-            override fun shouldOverrideUrlLoading(v: android.webkit.WebView, request: android.webkit.WebResourceRequest): Boolean {
+            override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
                 val u = request.url
-                val host = u.host?.lowercase() ?: return true
-                val allowed = listOf(
-                    "zchat.z.ai", "z.ai", "chat.z.ai", "bigmodel.cn", "dev.bigmodel.cn",
-                    "zcode.z.ai", "zcode.chatglm.site", "api.z.ai",
-                ).any { host == it || host.endsWith(".$it") }
-                Log.d(TAG, "auth nav: $u")
+                val allowed = u.scheme == "https" && BindingStore.isAllowedHost(u.host ?: "")
+                if (!allowed && request.isForMainFrame) showError("无法打开此授权链接，请关闭窗口后重新登录。")
                 return !allowed
             }
 
-            override fun onPageFinished(v: android.webkit.WebView, url: String) {
-                super.onPageFinished(v, url)
-                val u = android.net.Uri.parse(url)
-                val isCallback = u.host?.lowercase() == "zcode.z.ai" &&
-                    (u.path ?: "").startsWith("/api/v1/oauth/") &&
-                    (u.getQueryParameter("code") != null || u.getQueryParameter("error") != null)
-                if (isCallback) {
-                    hadCallback[0] = true
-                    v.evaluateJavascript("document.body.innerText.slice(0,160)") { text ->
-                        Log.i(TAG, "auth callback text: $text")
-                    }
-                    v.postDelayed(onDone, 600)
-                    return
-                }
-                // 授权确认自动完成（勾选协议 + 继续）；登录表单（手机号/验证码）不动
-                v.evaluateJavascript(
-                    "(function(){try{var t=document.body.innerText||'';" +
-                        "if(t.indexOf('手机号登录')!==-1||t.indexOf('发送验证码')!==-1)return 'login';" +
-                        "var bs=[].slice.call(document.querySelectorAll('button'));" +
-                        "var c=bs.filter(function(b){return (b.textContent||'').trim()==='继续';})[0];" +
-                        "if(!c)return 'none';" +
-                        "if(!c.disabled){c.click();return 'go';}" +
-                        "var cb=document.querySelector('input[type=checkbox]');" +
-                        "if(!cb){cb=bs.filter(function(b){return !(b.textContent||'').trim();})" +
-                        ".filter(function(b){var r=b.getBoundingClientRect();return r.width<30&&r.height<30;})[0];}" +
-                        "if(cb)cb.click();" +
-                        "setTimeout(function(){if(!c.disabled)c.click();},700);" +
-                        "return 'armed';}catch(e){return 'err';}})()",
-                ) { r ->
-                    if (r != null && (r.contains("go") || r.contains("armed"))) {
-                        Log.i(TAG, "auth auto-confirm: $r")
-                        if (!quiet) {
-                            android.widget.Toast.makeText(context, "已自动确认授权", android.widget.Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                }
+            override fun onPageStarted(v: WebView, url: String, favicon: Bitmap?) {
+                failed = false
+                progress.visibility = android.view.View.VISIBLE
+                status.visibility = android.view.View.GONE
+                retry.visibility = android.view.View.GONE
+                // 日志不记录授权码、state 或其它查询参数。
+                val uri = Uri.parse(url)
+                Log.d(TAG, "auth page: ${uri.host}${uri.path}")
             }
-        }
 
-    fun openAuthDialog(authUrl: String, silent: Boolean = false) {
-        val aw = android.webkit.WebView(context).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-        }
-        val hadCallback = booleanArrayOf(false)
-        if (!silent) {
-            val dialog = android.app.Dialog(context, android.R.style.Theme_Material_Light_NoActionBar)
-            aw.webViewClient = makeAuthClient(aw, hadCallback, false) { runCatching { dialog.dismiss() } }
-            // 顶栏：右上角 ✕ 随时关闭授权页（防止误点后无处可退）
-            val dp = context.resources.displayMetrics.density
-            val pad = (14 * dp).toInt()
-            val root = android.widget.LinearLayout(context).apply {
-                orientation = android.widget.LinearLayout.VERTICAL
-                setBackgroundColor(android.graphics.Color.WHITE)
+            override fun onPageFinished(v: WebView, url: String) {
+                progress.visibility = android.view.View.GONE
+                if (failed) return
+                status.visibility = android.view.View.GONE
+                retry.visibility = android.view.View.GONE
+                CookieManager.getInstance().flush()
+                if (isOAuthCallbackUrl(Uri.parse(url))) {
+                    // 回调由服务端处理；主页面自己轮询、落盘会话，不能在这里刷新主页面。
+                    v.postDelayed({ if (dialog.isShowing) dialog.dismiss() }, 800)
+                }
             }
-            val close = android.widget.TextView(context).apply {
-                text = "✕"
+
+            override fun onReceivedError(v: WebView, request: WebResourceRequest, error: WebResourceError) {
+                if (request.isForMainFrame || AuthAssets.matches(request.url)) showError("登录页面未能加载，请重试。")
+            }
+
+            override fun onReceivedHttpError(v: WebView, request: WebResourceRequest, response: android.webkit.WebResourceResponse) {
+                if (request.isForMainFrame || AuthAssets.matches(request.url)) showError("授权服务暂时无法访问（${response.statusCode}），请稍后重试。")
+            }
+        }
+        aw.webChromeClient = object : WebChromeClient() {
+            override fun onCloseWindow(window: WebView) { dialog.dismiss() }
+        }
+        val root = android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setBackgroundColor(android.graphics.Color.WHITE)
+        }
+        val mkBtn = { label: String ->
+            android.widget.TextView(context).apply {
+                text = label
                 textSize = 18f
                 setTextColor(android.graphics.Color.DKGRAY)
                 setPadding(pad, pad, pad, pad)
             }
-            // 页内返回：看协议等跳转后用它退回授权页（canGoBack 时），否则关闭
-            val back = android.widget.TextView(context).apply {
-                text = "←"
-                textSize = 18f
-                setTextColor(android.graphics.Color.DKGRAY)
-                setPadding(pad, pad, pad, pad)
-            }
-            val bar = android.widget.FrameLayout(context).apply {
-                addView(
-                    back,
-                    android.widget.FrameLayout.LayoutParams(
-                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
-                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
-                        android.view.Gravity.START or android.view.Gravity.CENTER_VERTICAL,
-                    ),
-                )
-                addView(
-                    close,
-                    android.widget.FrameLayout.LayoutParams(
-                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
-                        android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
-                        android.view.Gravity.END or android.view.Gravity.CENTER_VERTICAL,
-                    ),
-                )
-            }
-            back.setOnClickListener { if (aw.canGoBack()) aw.goBack() else dialog.dismiss() }
-            dialog.setOnKeyListener { _, keyCode, event ->
-                if (keyCode == android.view.KeyEvent.KEYCODE_BACK &&
-                    event.action == android.view.KeyEvent.ACTION_UP
-                ) {
-                    if (aw.canGoBack()) aw.goBack() else dialog.dismiss()
-                    true
-                } else {
-                    false
-                }
-            }
-            root.addView(
-                bar,
-                android.widget.LinearLayout.LayoutParams(
-                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
-                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
-                ),
-            )
-            root.addView(
-                aw,
-                android.widget.LinearLayout.LayoutParams(
-                    android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f,
-                ),
-            )
-            close.setOnClickListener { dialog.dismiss() }
-            dialog.setContentView(root)
-            dialog.setCanceledOnTouchOutside(false)
-            // 首次登录输验证码常超 60 秒，服务端 flow 会作废。
-            // 授权窗打开期间每 40 秒静默续期一次（主页面重新 init，新授权页由
-            // 隐藏 WebView 承载：zchat 未登录时它停在登录表单，无副作用；
-            // 用户输完码完成授权时，对应的正是最新 flow）→ 第一次就能成功。
-            val renew = object : Runnable {
-                override fun run() {
-                    if (hadCallback[0]) return
-                    Log.i(TAG, "flow renew: refresh login attempt")
-                    reloginCount.value = 0
-                    silentRelogin.value = true
-                    webView?.evaluateJavascript(
-                        "(function(){var c=[...document.querySelectorAll('button')].find(" +
-                            "function(x){return x.textContent.trim()==='取消'&&!x.disabled;});" +
-                            "if(c)c.click();return 'ok';})()", null,
-                    )
-                    webView?.postDelayed({
-                        webView?.evaluateJavascript(
-                            "(function(){var b=[...document.querySelectorAll('button')].find(" +
-                                "function(x){return x.textContent.trim()==='登录'&&!x.disabled;});" +
-                                "if(b){b.click();return 'retry';}return 'nobtn';})()",
-                        ) { r -> Log.i(TAG, "renew click: $r") }
-                    }, 800)
-                    aw.postDelayed(this, 40000)
-                }
-            }
-            aw.postDelayed(renew, 40000)
-            dialog.setOnDismissListener {
-                authDialogActive.value = false
-                aw.removeCallbacks(renew)
-                runCatching { aw.destroy() }
-                // 无论是否已回调都监测：手动误关后 8 秒内无会话也会自动续上登录
-                startPairWatch()
-            }
-            dialog.show()
-            authDialogActive.value = true
-        } else {
-            // 静默授权：0x0 容器承载 WebView，全程不可见
-            val host = android.widget.FrameLayout(context)
-            val lp = android.view.ViewGroup.LayoutParams(0, 0)
-            (context as? android.app.Activity)?.addContentView(host, lp)
-            host.addView(aw, android.widget.FrameLayout.LayoutParams(0, 0))
-            aw.postDelayed({
-                if (!hadCallback[0]) {
-                    Log.i(TAG, "silent auth: idle timeout, destroy")
-                    (host.parent as? android.view.ViewGroup)?.removeView(host)
-                    runCatching { aw.destroy() }
-                }
-            }, 90000)
-            aw.webViewClient = makeAuthClient(aw, hadCallback, true) {
-                (host.parent as? android.view.ViewGroup)?.removeView(host)
-                runCatching { aw.destroy() }
-                startPairWatch()
-            }
         }
-        aw.loadUrl(authUrl)
+        val back = mkBtn("←")
+        val close = mkBtn("✕")
+        val bar = android.widget.FrameLayout(context).apply {
+            addView(back, android.widget.FrameLayout.LayoutParams(-2, -2, android.view.Gravity.START))
+            addView(close, android.widget.FrameLayout.LayoutParams(-2, -2, android.view.Gravity.END))
+        }
+        root.addView(bar, android.widget.LinearLayout.LayoutParams(-1, -2))
+        root.addView(progress, android.widget.LinearLayout.LayoutParams(-1, (3 * dp).toInt()))
+        root.addView(status, android.widget.LinearLayout.LayoutParams(-1, -2))
+        root.addView(retry, android.widget.LinearLayout.LayoutParams(-1, -2))
+        root.addView(aw, android.widget.LinearLayout.LayoutParams(-1, 0, 1f))
+        retry.setOnClickListener { aw.reload() }
+        back.setOnClickListener { if (aw.canGoBack()) aw.goBack() else dialog.dismiss() }
+        close.setOnClickListener { dialog.dismiss() }
+        dialog.setOnKeyListener { _, keyCode, event ->
+            if (keyCode == android.view.KeyEvent.KEYCODE_BACK && event.action == android.view.KeyEvent.ACTION_UP) {
+                if (aw.canGoBack()) aw.goBack() else dialog.dismiss()
+                true
+            } else false
+        }
+        dialog.setContentView(root)
+        dialog.setCanceledOnTouchOutside(false)
+        dialog.setOnDismissListener {
+            aw.stopLoading()
+            root.removeView(aw)
+            aw.destroy()
+        }
+        dialog.show()
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        return aw
     }
-
 
     // 最近一次页面自发提示音（pop）时间，用于避免与系统通知双重响铃
     var lastPopAt by remember { mutableStateOf(0L) }
@@ -403,11 +271,19 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
                 modifier = Modifier.weight(1f).padding(start = 12.dp),
             )
             TextButton(onClick = onNeedRescan) { Text(stringResource(R.string.menu_rescan)) }
-            IconButton(onClick = { webView?.reload() }, modifier = Modifier.size(40.dp)) {
-                Text("⟳", color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.titleMedium)
+            IconButton(onClick = { webView?.reload() }) {
+                Icon(
+                    painter = androidx.compose.ui.res.painterResource(R.drawable.ic_refresh),
+                    contentDescription = stringResource(R.string.menu_reload),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
-            IconButton(onClick = { settingsOpen = true }, modifier = Modifier.size(40.dp)) {
-                Text("⚙", color = MaterialTheme.colorScheme.onSurface, style = MaterialTheme.typography.titleMedium)
+            IconButton(onClick = { settingsOpen = true }) {
+                Icon(
+                    painter = androidx.compose.ui.res.painterResource(R.drawable.ic_settings),
+                    contentDescription = stringResource(R.string.menu_settings),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
         Box(modifier = Modifier.weight(1f)) {
@@ -439,35 +315,11 @@ fun WebScreen(url: String, onNeedRescan: () -> Unit) {
                     onWebViewRecreated = { reloadKey++ },
                     onLongPress = { menuOpen = true },
                     onPageReady = { pageLoaded = true },
-            onOpenAuth = { authUrl ->
-                val silent = silentRelogin.value || authDialogActive.value
-                silentRelogin.value = false
-                openAuthDialog(authUrl, silent)
-            },
+                    onCreateAuthWindow = { openAuthDialog() },
                 ).also { webView = it }
             },
             update = { /* URL 变化不重建；由调用方控制 */ },
         )
-
-        // 重新授权遮罩：盖住超时红字，避免「红字闪一下」
-        if (authRetrying) {
-            Box(
-                modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background),
-                contentAlignment = Alignment.Center,
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    androidx.compose.material3.CircularProgressIndicator(
-                        modifier = Modifier.size(28.dp), strokeWidth = 2.5.dp,
-                    )
-                    Text(
-                        "正在完成登录…",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 14.dp),
-                    )
-                }
-            }
-        }
 
         // 首帧加载层：主题色背景 + logo + 转圈，避免加载期间白屏
         if (!pageLoaded) {
@@ -564,23 +416,9 @@ private val OAUTH_CALLBACK_PATH = Regex("^/api/v1/oauth/.*/callback(/.*)?$")
 
 /** 服务端 OAuth 回调 URL（zcode.z.ai/api/v1/oauth/&lt;provider&gt;/callback?code&state…）。 */
 private fun isOAuthCallbackUrl(u: Uri): Boolean =
-    u.host?.lowercase() == "zcode.z.ai" &&
+    u.scheme == "https" && u.host?.lowercase() in setOf("zcode.z.ai", "zcode.chatglm.site") &&
         OAUTH_CALLBACK_PATH.matches(u.path ?: "") &&
         (u.getQueryParameter("code") != null || u.getQueryParameter("error") != null)
-
-/**
- * 把回调参数拼回 SPA 绑定 URL。SPA 检测到自身 URL 携带 code&state 后，
- * 会走 handleCallback → 客户端 exchangeToken（/api/v1/oauth/token）完成登录；
- * state 自包含（nonce+return_to），SPA 重启也能校验。
- */
-private fun buildSpaCallbackUrl(spaUrl: String, callback: Uri): String {
-    val base = Uri.parse(spaUrl).buildUpon()
-    callback.getQueryParameter("code")?.let { base.appendQueryParameter("code", it) }
-    callback.getQueryParameter("authCode")?.let { base.appendQueryParameter("authCode", it) }
-    callback.getQueryParameter("error")?.let { base.appendQueryParameter("error", it) }
-    callback.getQueryParameter("state")?.let { base.appendQueryParameter("state", it) }
-    return base.build().toString()
-}
 
 private fun createWebView(
     ctx: android.content.Context,
@@ -593,7 +431,7 @@ private fun createWebView(
     onWebViewRecreated: () -> Unit,
     onLongPress: () -> Unit,
     onPageReady: () -> Unit,
-    onOpenAuth: (String) -> Unit,
+    onCreateAuthWindow: () -> WebView,
 ): WebView {
     val main = WebView(ctx).apply {
         layoutParams = ViewGroup.LayoutParams(
@@ -622,7 +460,6 @@ private fun createWebView(
             NativeBridge(
                 onNotify = onNotify,
                 onKicked = onKicked,
-                onOpenAuth = { url -> onOpenAuth(url) },
             ),
             "ZCodeNative",
         )
@@ -635,13 +472,6 @@ private fun createWebView(
                 val u = request.url
                 val scheme = u.scheme?.lowercase()
                 return when {
-                    // OAuth 服务端回调：把 code&state 转交给 SPA 自身 URL 完成客户端换 token
-                    request.isForMainFrame && isOAuthCallbackUrl(u) -> {
-                        val target = buildSpaCallbackUrl(initialUrl, u)
-                        Log.d(TAG, "oauth callback -> spa: $u => $target")
-                        view.loadUrl(target)
-                        true
-                    }
                     // 白名单域：页面内部加载（含 OAuth 授权页跳转）
                     (scheme == "https" || scheme == "http") &&
                         BindingStore.isAllowedHost(u.host ?: "") -> false
@@ -659,15 +489,7 @@ private fun createWebView(
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
-                Log.d(TAG, "page started: $url")
-                // 302 服务端重定向不经过 shouldOverrideUrlLoading：回调页已开载时同样改道回 SPA
-                val startedUri = Uri.parse(url)
-                if (isOAuthCallbackUrl(startedUri)) {
-                    val target = buildSpaCallbackUrl(initialUrl, startedUri)
-                    Log.d(TAG, "oauth callback (redirect) -> spa: $target")
-                    view.loadUrl(target)
-                    return
-                }
+                Log.d(TAG, "page started: ${Uri.parse(url).host}${Uri.parse(url).path}")
                 // 尽早注入（抢 Audio 构造器包装时机）
                 onPageStartedInject(view)
             }
@@ -698,34 +520,15 @@ private fun createWebView(
         }
 
         webChromeClient = object : WebChromeClient() {
-            /**
-             * 新窗口（window.open / target=_blank）：不内嵌渲染（叠层白屏），
-             * 用一次性 transport 捕获 URL → 交给授权弹窗（openAuthDialog）打开。
-             */
+            // 把真实授权 WebView 交给 Chromium，保留 window.open / closed / close 的窗口语义。
             override fun onCreateWindow(
                 view: WebView,
                 isDialog: Boolean,
                 isUserGesture: Boolean,
                 resultMsg: Message,
             ): Boolean {
-                val captured = arrayOfNulls<String>(1)
-                val transport = WebView(view.context)
-                transport.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {
-                        val u = request.url.toString()
-                        if (captured[0] == null) {
-                            captured[0] = u
-                            Log.d(TAG, "auth popup captured: $u")
-                            onOpenAuth(u)
-                        }
-                        return true
-                    }
-                }
-                (resultMsg.obj as WebView.WebViewTransport).webView = transport
+                (resultMsg.obj as WebView.WebViewTransport).webView = onCreateAuthWindow()
                 resultMsg.sendToTarget()
-                Handler(Looper.getMainLooper()).postDelayed({
-                    runCatching { transport.destroy() }
-                }, 8000)
                 return true
             }
 

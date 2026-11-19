@@ -229,33 +229,6 @@
     } catch (e) {}
   }
 
-  /* ---------------- ⓪-c window.open 拦截：OAuth 授权页交给原生 Activity ----------------
-   * 内嵌弹窗 WebView 与主 WebView 叠层时上层不绘制（白屏），改由独立 Activity 承载。
-   * 仅拦截授权域名，其它 window.open 保持原生行为。 */
-  if (!window.__zcOpenHooked) {
-    window.__zcOpenHooked = true;
-    try {
-      var zcOrigOpen = window.open;
-      window.open = function (url, name, features) {
-        try {
-          var s = String(url || '');
-          var isAuth = /^https:\/\/([a-z0-9-]+\.)*(zchat\.z\.ai|chat\.z\.ai|bigmodel\.cn|dev\.bigmodel\.cn)\//i.test(s) ||
-            s.indexOf('/oauth/authorize') !== -1 ||
-            s.indexOf('/api/oauth/authorize') !== -1;
-          if (isAuth) {
-            var b = null;
-            try { b = window.ZCodeNative; } catch (e) {}
-            if (b && b.openAuth) {
-              b.openAuth(s);
-              return null;
-            }
-          }
-        } catch (e) {}
-        return zcOrigOpen.apply(window, arguments);
-      };
-    } catch (e) {}
-  }
-
   /* ---------------- ① Audio 钩子（只装一次，越早越好） ---------------- */
   if (!window.__zcAudioHooked) {
     window.__zcAudioHooked = true;
