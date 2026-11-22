@@ -1,6 +1,8 @@
 package com.autosquare.zcode.mobile.ui
 
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.net.Uri
@@ -8,6 +10,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.provider.Settings
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -18,11 +21,14 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.webkit.RenderProcessGoneDetail
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -663,7 +669,7 @@ private fun SettingsDialog(onDismiss: () -> Unit) {
             color = MaterialTheme.colorScheme.surface,
             shape = MaterialTheme.shapes.large,
         ) {
-            Column(modifier = Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
                 Text(stringResource(R.string.menu_settings), style = MaterialTheme.typography.titleMedium)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
@@ -685,6 +691,23 @@ private fun SettingsDialog(onDismiss: () -> Unit) {
                             }
                         },
                     )
+                }
+                if (keepalive) {
+                    val hint = if (Build.MANUFACTURER.equals("HUAWEI", ignoreCase = true)) {
+                        R.string.settings_background_huawei
+                    } else {
+                        R.string.settings_background_system
+                    }
+                    Text(stringResource(hint), style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = {
+                        val details = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            Uri.fromParts("package", context.packageName, null))
+                        try {
+                            context.startActivity(details)
+                        } catch (_: ActivityNotFoundException) {
+                            Toast.makeText(context, R.string.settings_background_manual, Toast.LENGTH_LONG).show()
+                        }
+                    }) { Text(stringResource(R.string.settings_background_open)) }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {

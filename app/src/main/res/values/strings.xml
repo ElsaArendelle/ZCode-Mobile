@@ -17,7 +17,11 @@
     <string name="menu_reload">刷新页面</string>
     <string name="menu_settings">设置</string>
     <string name="settings_keepalive">后台提醒</string>
-    <string name="settings_keepalive_desc">锁屏或切到其他 App 时仍能收到任务提醒。使用 App 期间不会出现任何常驻通知（仅退到后台时系统要求挂一条隐藏提示）。</string>
+    <string name="settings_keepalive_desc">切到后台后保持工作区连接，并显示一条静默通知。</string>
+    <string name="settings_background_huawei">长时间锁屏或切走后收不到提醒？在应用信息中打开「耗电详情 → 启动管理」，关闭「自动管理」，开启「允许后台活动」。部分机型可在系统设置中搜索「应用启动管理」。</string>
+    <string name="settings_background_system">长时间锁屏或切走后收不到提醒？在系统应用信息中检查 ZCode 的电池设置，允许后台运行。</string>
+    <string name="settings_background_open">打开 ZCode 系统应用信息</string>
+    <string name="settings_background_manual">请在系统设置的应用列表中打开 ZCode。</string>
     <string name="settings_sound">提醒声音</string>
     <string name="web_offline">页面加载失败，请检查网络</string>
     <string name="web_retry">重试</string>

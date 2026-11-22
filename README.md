@@ -36,7 +36,7 @@
 | 📷 | **扫码绑定** | 相机扫描桌面端连接码；支持从相册选取二维码截图识别 |
 | ⚡ | **免扫码直达** | 绑定一次，之后打开 App 直接连上电脑 |
 | 🌐 | **无外壳浏览** | 系统 WebView（Chromium 内核）加载官方移动页，无地址栏、无标签页，OAuth 全程应用内完成 |
-| 🔔 | **任务提醒** | 任务完成 / 出错 / 需要确认 → 系统通知 + 提示音，前台后台均可送达 |
+| 🔔 | **任务提醒** | 工作区连接期间，任务完成、出错或需要确认时会发出系统通知 |
 | 🔄 | **后台保持** | 切后台自动挂前台服务保活；前台使用期间无任何常驻通知 |
 | 🌓 | **主题跟随系统** | 深色 / 浅色全局一致（页面、状态栏、窗口、闪屏） |
 | 🔒 | **隐私优先** | 无广告、无统计 SDK；网页导航限制在 ZCode 与授权域名白名单内 |
@@ -52,7 +52,7 @@
 
 ## 下载安装
 
-- **Release 版**：从 [Releases](../../releases) 下载最新的 `app-release.apk`，在手机上直接安装（需允许「安装未知来源应用」）。
+- **Release 版**：从 [Releases](../../releases) 下载对应版本的 APK（本版为 `ZCodeMobile-v1.0.1-release.apk`），在手机上打开即可安装或覆盖升级。
 - **自行构建**：见下方[从源码构建](#从源码构建)。
 
 ## 快速上手
@@ -103,6 +103,8 @@
 
 Android 13+ 首次启动时允许通知权限。连接期间任务事件会转为 Android 通知；**后台提醒**与**提醒声音**默认开启，可在 ⚙ 设置中调整。切到后台后通知栏会出现一条静默的「ZCode 连接保持中」，回到 App 自动收起；从最近任务划掉 App 即结束连接。
 
+**华为手机短时间能收提醒，切走较久后需要重连**：在 ZCode 的 ⚙ 设置中点「打开 ZCode 系统应用信息」，进入「耗电详情 → 启动管理」，关闭「自动管理」，打开「允许后台活动」并确定。菜单位置不同的机型可在系统设置中搜索「应用启动管理」，找到 ZCode。系统清理应用进程后，工作区连接会随之断开。[华为后台运行说明](https://consumer.huawei.com/cn/support/content/zh-cn00428704/)
+
 | 首次允许通知 | 任务完成时 | 切到后台后 |
 | --- | --- | --- |
 | ![Android 询问是否允许通知](docs/assets/screenshots/notification-permission.png) | ![通知栏显示任务已完成](docs/assets/screenshots/task-notification.png) | ![通知栏显示连接保持中](docs/assets/screenshots/background-notification.png) |
@@ -137,14 +139,14 @@ Android 13+ 首次启动时允许通知权限。连接期间任务事件会转�
 
 ```sh
 # Windows (PowerShell)
-.\gradlew.bat assembleDebug        # 产物: app/build/outputs/apk/debug/app-debug.apk
+.\gradlew.bat assembleDebug        # 产物位于 app/build/outputs/apk/debug/
 .\gradlew.bat installDebug         # 构建并安装到已连接设备
 
 # macOS / Linux
 sh ./gradlew assembleDebug
 ```
 
-**发布签名**：在仓库根目录放置 `key.properties`（`storeFile` / `storePassword` / `keyAlias` / `keyPassword`）与对应密钥库，运行 `assembleRelease`，产物位于 `app/build/outputs/apk/release/app-release.apk`。密钥文件已被 `.gitignore` 排除，请妥善备份——**更换密钥将导致老用户无法覆盖升级**。
+**发布签名**：在仓库根目录放置 `key.properties`（`storeFile` / `storePassword` / `keyAlias` / `keyPassword`）与对应密钥库，运行 `assembleRelease`。安装包位于 `app/build/outputs/apk/release/`，文件名格式为 `ZCodeMobile-v<版本号>-release.apk`。密钥文件已被 `.gitignore` 排除，请妥善备份——**更换密钥将导致老用户无法覆盖升级**。
 
 架构设计、WebView 与通知实现、调试与排障见[开发文档](docs/README.md)。
 

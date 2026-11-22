@@ -75,6 +75,12 @@ ConnectionService (前台服务 specialUse)
 
 开启后台提醒后，主工作区 WebView 在窗口隐藏时保持可见性，避免移动页主动暂停中继心跳。授权窗口保持系统默认行为。Activity 在退后台时请求连接服务，服务收到启动命令后先调用 `startForeground`，再核对当前是否仍须运行。快速切回前台或关闭提醒时，待投递的启动命令仍能完成系统要求的前台服务登记。进程被系统终止后，单独重建服务无法恢复 WebView 会话。
 
+华为 JEF-AN00 上曾出现短时间切换正常、长时间后台后需要重连。重新打开应用前，先用 `adb shell dumpsys activity exit-info com.autosquare.zcode.mobile` 检查主进程的退出时间和 description，再用 `adb shell dumpsys usagestats` 对照退后台时间。2026-11-22 的 `iAwareF[SystemManager]` 记录发生在切走约一秒后，检查时包状态为 `stopped=true`。此前还有两次独立的 `iAwareF[LowMem](fg-service)` 记录。只有退出时间和故障时间吻合，才能据此判断那一次断连的原因。
+
+`WebScreen.kt` 的设置面板通过 Android 的 `ACTION_APPLICATION_DETAILS_SETTINGS` 打开本包应用信息。华为机型显示「耗电详情 → 启动管理」路径，用户可以单独为 ZCode 开启「允许后台活动」。复测时把已连接的工作区退到后台，在原先会断开的时长之后，从桌面端完成一条任务；回到手机应用之前先检查任务通知，单凭常驻服务或进程仍在无法确认消息送达。
+
+2026-11-22 在 JEF-AN00 上单独为 ZCode 开启「允许后台活动」后，使用带上述入口的 Release 测试包复测。系统记录工作区于 18:07:30 退到后台，18:39:02 在任务通知通道 `alerts` 发出提醒，18:39:13 才回到前台。该次提醒在连续后台约 31 分半时送达。
+
 任务事件从中继帧携带 `taskId` 到 Android，系统通知各自持有独立的不可变 PendingIntent。点击后等待工作区就绪，按任务 ID 打开列表项。目标行折叠时，通过工作区搜索按 ID 核对结果；已打开其他会话时先返回任务列表。页面显示匹配的会话 ID 后结束定位。无目标或目标不可用时显示原通知内容。静默的连接通知仍用于返回应用。
 
 回归检查可运行 `node tests/task-notifications.mjs`。真机验收时先打开任务 A，再回到 Android 桌面，让电脑完成任务 B。先在手机通知栏确认收到 B 的提醒，再点通知核对会话标题及最新回复。2026-11-20 已在华为 JEF-AN00 的 Release 包跑通这条路径。
