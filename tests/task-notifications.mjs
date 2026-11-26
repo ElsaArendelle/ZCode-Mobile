@@ -13,6 +13,7 @@ class Media {
 }
 const cachedCue = new Media('/remote/v4/latest/assets/task-notification-pop-abc.mp3?v=1');
 const page = {
+  atob, TextDecoder,
   console: { log() {} },
   setTimeout(fn, ms) { if (ms === 350) fallbackTimers.push(fn); },
   CSS: { escape: value => value },
@@ -104,9 +105,66 @@ phase('mixed', 'completedSuccess', '在吗');
 page.__zcFeed(JSON.stringify({ sessionId: 'mixed', phase: 'running' }));
 page.__zcFeed(JSON.stringify({ sessionId: 'mixed', phase: 'completedSuccess' }));
 assert.equal(alerts.length, beforeReplay + 1, '兼容数据流迟到的 running 不会重新开启已结束的一轮');
+// 工作区列表订阅任务索引，提问期间 phase 仍为 running。
+const inputStart = alerts.length;
+function indexRequest(taskId, pendingInteraction, lastActivityAt) {
+  const task = { meta: { taskId, title: '同名任务', pendingInteraction },
+    activity: { phase: 'running', lastActivityAt } };
+  const frame = Buffer.from('\0' + JSON.stringify({ deltas: [{ task }] })).toString('base64');
+  page.__zcFeed(JSON.stringify({ type: 'data', payload: { dataBase64: frame } }));
+}
+const ask = { interactionId: 'q1', kind: 'userInput', toolName: 'AskUserQuestion' };
+indexRequest('a', null, 1);
+indexRequest('a', ask, 2);
+indexRequest('a', ask, 2);
+indexRequest('b', ask, 2); // 请求 ID 的作用域为任务。
+page.__zcFeed(JSON.stringify({ sessionId: 'a', phase: 'running', pendingInteraction: ask }));
+indexRequest('a', { ...ask, interactionId: 'q2' }, 3);
+indexRequest('a', { ...ask, interactionId: 'stale' }, 1);
+const plan = { interactionId: 'plan', kind: 'userInput', toolName: 'ExitPlanMode' };
+page.__zcFeed(JSON.stringify({ sessionId: 'c', phase: 'running', pendingInteraction: plan }));
+indexRequest('c', plan, 4);
+function snapshot(id, interactionId, payload) {
+  page.__zcFeed(JSON.stringify({ sessionId: id, meta: { title: '审批任务' },
+    pendingInteractions: [{ interactionId, payload }] }));
+}
+snapshot('c', 'plan', { kind: 'userInput', schema: { interaction: 'plan_approval' } });
+snapshot('d', 'p2', { kind: 'userInput', schema: { interaction: 'plan_approval' } });
+snapshot('d', 'p3', { kind: 'permission' });
+snapshot('d', 'ignored', { kind: 'workspaceHookReview' });
+browserResult('计划等待确认', '审批任务', 'd');
+fallbackTimers.splice(0).forEach(fn => fn());
+assert.deepEqual(alerts.slice(inputStart).map(a => [a[1], a[4]]), [
+  ['需要你的回复', 'a'], ['需要你的回复', 'b'], ['需要你的回复', 'a'],
+  ['计划等待确认', 'c'], ['计划等待确认', 'd'], ['需要你的确认', 'd'],
+]);
+assert.equal(new Set(alerts.slice(inputStart).map(a => a[3])).size, 6);
+const livePatch = { topic: 'conversation/c', payload: { kind: 'deltas', deltas: [
+  { op: 'state.updated', patch: { pendingInteractions: [
+    { interactionId: 'plan-2', payload: { kind: 'userInput', schema: { toolName: 'ExitPlanMode' } } },
+  ] } },
+] } };
+page.__zcFeed(JSON.stringify(livePatch));
+page.__zcFeed(JSON.stringify(livePatch));
+assert.deepEqual(alerts.slice(inputStart + 6).map(a => [a[1], a[4]]), [['计划等待确认', 'c']]);
+const countStart = alerts.length;
+function counts(userInputCount, permissionCount) {
+  page.__zcFeed(JSON.stringify({ meta: { taskId: 'count-only', title: '计数摘要' },
+    activity: { phase: 'running', pendingInteractions: { userInputCount, permissionCount } } }));
+}
+counts(1, 0);
+counts(1, 0);
+fallbackTimers.splice(0).forEach(fn => fn());
+snapshot('count-only', 'identified-later', { kind: 'userInput', toolName: 'ExitPlanMode' });
+counts(0, 0);
+counts(1, 0);
+counts(1, 1);
+fallbackTimers.splice(0).forEach(fn => fn());
+assert.deepEqual(alerts.slice(countStart).map(a => a[1]), ['需要你的回复', '需要你的回复', '需要你的确认']);
+assert.equal(new Set(alerts.slice(countStart).map(a => a[3])).size, 3);
 await cachedCue.play();
 await cachedCue.play();
 assert.equal(mediaPlays, 0, '页面复用提示音对象也不会再响');
 await new Media('/assets/preview.mp3').play();
 assert.equal(mediaPlays, 1, '其它媒体仍按原方式播放');
-console.log('完成和失败去重、连续两轮、同名任务、单来源提醒及点击路由通过');
+console.log('任务完成、失败、用户提问、计划审批、权限请求、跨来源去重及点击路由通过');

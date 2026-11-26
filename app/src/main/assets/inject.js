@@ -33,6 +33,43 @@
 
   // 两条来源共用同一份短期结果记录。重复注入不会重置它。
   var results = window.__zcRecentResults || (window.__zcRecentResults = { entries: [], sequence: 0 });
+  var interactions = window.__zcInteractionAlerts || (window.__zcInteractionAlerts = { seen: new Set(), recent: [] });
+  function reportInteraction(source, title, body, taskId, requestId) {
+    var key = requestId ? JSON.stringify(['interaction', taskId, requestId]) : '';
+    if (key) {
+      if (interactions.seen.has(key)) return;
+      interactions.seen.add(key);
+      if (interactions.seen.size > 1024) interactions.seen.delete(interactions.seen.values().next().value);
+    }
+    var now = Date.now();
+    interactions.recent = interactions.recent.filter(e => now - e.at < 10000);
+    // 网页通知和旧版弹窗可能没有请求 ID。每条回退提醒只与另一来源配对一次。
+    var match = interactions.recent.find(e =>
+      !e.sources.has(source) && !(key && e.key) &&
+      (taskId && e.taskId ? taskId === e.taskId : body && body === e.body) &&
+      (title === e.title || source === 'dialog' || e.sources.has('dialog') ||
+        ((source === 'summary' || e.sources.has('summary')) &&
+         [title, e.title].includes('计划等待确认') && [title, e.title].includes('需要你的回复'))));
+    if (match) {
+      match.sources.add(source);
+      if (key) match.key = key;
+      return;
+    }
+    interactions.recent.push({ at: now, key, title, body, taskId, sources: new Set([source]) });
+    var fallbackKey = source === 'summary' ? 'summary|' + taskId + '|' + now + '|' + ++results.sequence :
+      'input|' + source + '|' + taskId + '|' + title + '|' + body;
+    bridge()?.notifyTask('input', title, body, key || fallbackKey, taskId);
+  }
+  function noteInteraction(taskId, request, name) {
+    if (!request || typeof request.interactionId !== 'string' || !request.interactionId) return;
+    var payload = request.payload || request;
+    if (payload.kind !== 'userInput' && payload.kind !== 'permission') return;
+    var plan = payload.toolName === 'ExitPlanMode' || payload.schema?.interaction === 'plan_approval' ||
+      payload.schema?.toolName === 'ExitPlanMode';
+    var title = plan ? '计划等待确认' : payload.kind === 'permission' ? '需要你的确认' : '需要你的回复';
+    name = name || taskNames.get(taskId);
+    reportInteraction('relay', title, name ? '任务：' + name : '', taskId, request.interactionId);
+  }
   function reportResult(source, outcome, title, body, id) {
     var now = Date.now();
     results.entries = results.entries.filter(function (e) { return now - e.at < 10000; });
@@ -120,6 +157,10 @@
               setTimeout(() => reportResult('web', outcome, title, this.body, idForBody(this.body)), 350);
             } else if (outcome) {
               reportResult('web', outcome, title, this.body, id);
+            } else if (['需要你的回复', '需要你的确认', '计划等待确认', '任务等待你的确认'].includes(title)) {
+              var owner = document.querySelector('[data-session-id]');
+              var ownerId = id || owner?.getAttribute('data-session-id') || '';
+              setTimeout(() => reportInteraction('web', title, this.body, ownerId, options?.data?.requestId), 350);
             } else {
               b.notifyTask('task', String(title || ''), this.body, 'ntf|' + title + '|' + this.body, id);
             }
@@ -158,8 +199,33 @@
       var OrigWS = window.WebSocket;
       var lastPhase = {};
       var taskVersions = new Map();
+      var pendingCounts = new Map();
       var seenTypes = {};
 
+      function noteSummary(taskId, request, counts, name) {
+        noteInteraction(taskId, request, name);
+        // 有些任务索引只有分类计数。仅在对应计数增加时提醒，优先保留带请求 ID 的详情。
+        if (!counts || !(counts.userInputCount || counts.permissionCount)) {
+          pendingCounts.delete(taskId);
+          return;
+        }
+        var state = pendingCounts.get(taskId) || {};
+        pendingCounts.set(taskId, state);
+        for (const [field, kind, title] of [
+          ['userInputCount', 'userInput', '需要你的回复'], ['permissionCount', 'permission', '需要你的确认'],
+        ]) {
+          const count = counts[field] || 0;
+          const previous = state[field]?.count || 0;
+          if (count === previous) continue;
+          const change = state[field] = { count };
+          if (count < previous || (request?.interactionId && request.kind === kind)) continue;
+          setTimeout(() => {
+            if (pendingCounts.get(taskId)?.[field] === change) {
+              reportInteraction('summary', title, name ? '任务：' + name : '', taskId, '');
+            }
+          }, 350);
+        }
+      }
       function isDone(ph) {
         return ph === 'completedSuccess' || ph === 'completedInterrupted' ||
           ph === 'completed' || ph === 'done';
@@ -189,6 +255,16 @@
           for (var i = 0; i < obj.length && i < 300; i++) scan(obj[i], depth + 1);
           return;
         }
+        // 会话增量不重复携带 sessionId，目标任务由订阅主题指定。
+        if (typeof obj.topic === 'string' && obj.topic.startsWith('conversation/') &&
+            obj.payload?.kind === 'deltas' && Array.isArray(obj.payload.deltas)) {
+          var conversationId = obj.topic.slice('conversation/'.length);
+          for (var delta of obj.payload.deltas) {
+            if (conversationId && delta?.op === 'state.updated' && Array.isArray(delta.patch?.pendingInteractions)) {
+              delta.patch.pendingInteractions.forEach(request => noteInteraction(conversationId, request, delta.patch.meta?.title));
+            }
+          }
+        }
         // 真实 schema：task.meta{taskId,title} + task.activity.phase / task.liveStatus
         var meta = obj.meta;
         var act = obj.activity;
@@ -200,12 +276,22 @@
           if (!version || version >= previousVersion) {
             taskVersions.set(meta.taskId, version || previousVersion);
             notePhase(meta.taskId, ph2, meta.title || '');
+            noteSummary(meta.taskId, meta.pendingInteraction, act?.pendingInteractions, meta.title);
           }
         }
         // 兼容旧 schema：{sessionId, phase, title}
         var sid = obj.sessionId || obj.session_id;
-        if (typeof sid === 'string' && typeof obj.phase === 'string' && !taskVersions.has(sid)) {
-          notePhase(sid, obj.phase, obj.title || obj.name || '');
+        if (typeof sid === 'string') {
+          if (typeof obj.phase === 'string') {
+            if (!taskVersions.has(sid)) notePhase(sid, obj.phase, obj.title || obj.name || '');
+            if (!obj.lastActivityAt || obj.lastActivityAt >= (taskVersions.get(sid) || 0)) {
+              if (taskVersions.has(sid)) noteInteraction(sid, obj.pendingInteraction, obj.title);
+              else noteSummary(sid, obj.pendingInteraction, obj.pendingInteractionSummary, obj.title);
+            }
+          }
+          if (Array.isArray(obj.pendingInteractions)) {
+            obj.pendingInteractions.forEach(request => noteInteraction(sid, request, meta?.title));
+          }
         }
         for (var k in obj) {
           if (Object.prototype.hasOwnProperty.call(obj, k)) {
@@ -473,8 +559,9 @@
     if (tid === TID_DIALOG) {
       // 权限 / 输入请求模态（fixed inset-0 z-[100]）
       var owner = node.closest('[data-session-id]') || document.querySelector('[data-session-id]');
-      send('input', '需要你的确认', textOf(node, 200), 'dialog|' + Math.floor(Date.now() / 8000), 8000,
-        owner && owner.getAttribute('data-session-id'));
+      var ownerId = owner?.getAttribute('data-session-id') || '';
+      var dialogBody = textOf(node, 200);
+      setTimeout(() => reportInteraction('dialog', '需要你的确认', dialogBody, ownerId, ''), 350);
       return;
     }
     if (tid && TID_BADGES.indexOf(tid) !== -1) {

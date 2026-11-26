@@ -52,7 +52,7 @@
 
 ## 下载安装
 
-- **Release 版**：从 [Releases](../../releases) 下载对应版本的 APK（本版为 `ZCodeMobile-v1.0.1-release.apk`），在手机上打开即可安装或覆盖升级。
+- **Release 版**：从 [Releases](../../releases) 下载对应版本的 APK（本版为 `ZCodeMobile-v1.0.2-release.apk`），在手机上打开即可安装或覆盖升级。
 - **自行构建**：见下方[从源码构建](#从源码构建)。
 
 ## 快速上手

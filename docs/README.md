@@ -44,6 +44,7 @@ MainActivity (singleTask)
      │    │   deltas[].task.meta{taskId,title} + task.activity.phase（running/completedSuccess/error）。
      │    │   维护 taskId→phase，相位跃迁到完成/失败 → 原生通知（首见只做基线，避免历史任务刷屏）。
      │    │   同一任务优先使用任务索引的活动时间与状态，忽略滞后的旧版会话状态。
+     │    │   任务仍在 running 时，单独读取待处理交互，向 Android 上报提问、计划审批和权限确认。
      │    ├─ ⓪ window.Notification 垫片（兜底）：页面 web 模式 showTaskNotification 的实现是
      │    │   `if (!document.hasFocus() && Notification.permission==='granted') new Notification(title,{body})`，
      │    │   WebView 里该 API 恒为 denied → 页面通知永不触发。垫片伪装 granted 并把
@@ -92,6 +93,14 @@ ConnectionService (前台服务 specialUse)
 | `alerts_silent` | App 内关闭「提醒声音」时的任务通知 | 无 |
 
 中继状态变化和网页 Notification 都可能报告一次任务结束。`inject.js` 按任务 ID 和完成／失败结果在 10 秒内合并，重新进入 running 后开启下一轮。网页只给出标题时短暂等待中继，再用 ID 或未配对的同名结果匹配。两个不同 ID 的同名任务分别提醒。Android 端仍按 `dedupeKey` 在 10 秒内去重；关闭提醒声音时使用静默通道。
+
+**提问和审批**。工作区列表从任务索引的 `meta.pendingInteraction` 或会话摘要的 `pendingInteraction` 读取未处理请求。会话详情从 `pendingInteractions` 快照和 `conversation/<sessionId>` 的 `state.updated` 增量读取。普通 `userInput` 提醒「需要你的回复」，`ExitPlanMode` 或带 `plan_approval` 标记的请求提醒「计划等待确认」，权限请求提醒「需要你的确认」。这些提醒使用原有任务通知通道，点击后进入对应任务。
+
+同一页面内按任务 ID 和请求 ID 识别重复同步，下一次提问使用新的请求 ID。只有分类计数时，在待处理数量增加时生成对应类别的通用提醒。回归用例覆盖停留在列表、会话内增量、同名任务、连续提问及重复帧。Android 设备允许测试应用发送通知后，可用 `InteractionNotificationTest` 检查 WebView 到系统任务通知通道的投递。
+
+2026-11-26 的 Android 模拟器测试在工作区外使用测试数据，依次送入用户提问、计划批准和同一计划批准的重放。系统 `alerts` 通道最终出现两条通知，标题分别为「需要你的回复」和「计划等待确认」。
+
+同日使用华为 JEF-AN00 和签名 Release 包验证桌面端实际请求。结束模拟器占用的配对并让真机重新连接后，手机在 23:28:24 退到后台。23:30:20 的计划审批触发「计划等待确认」，23:31:37 的新提问触发「需要你的回复」。两条通知均进入 `alerts` 通道，期间系统没有记录 ZCode 界面回到前台。
 
 熄屏验收时，同时检查 Android 的 `notification_enqueue` 事件和 `dumpsys audio` 的音频焦点记录。华为真机曾在同一条提醒后先出现系统的 `USAGE_NOTIFICATION`，约一秒后又出现 WebView 的 `USAGE_MEDIA`。修复后，同轮实测只有一次任务通知入队和一次系统通知音频请求。
 
